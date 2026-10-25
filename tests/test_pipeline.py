@@ -45,6 +45,15 @@ def test_end_to_end(tmp_path):
     assert np.load(clip.features_path).shape[:2] == (4, 64)
 
 
+def test_workers_give_identical_dataset(tmp_path):
+    a = run(out_dir=str(tmp_path / "a"), n_rooms=3, clips_per_room=2, seed=5, workers=1)
+    b = run(out_dir=str(tmp_path / "b"), n_rooms=3, clips_per_room=2, seed=5, workers=3)
+    cols = (Clip.azimuth_deg, Clip.rt60_measured, Clip.snr_achieved_db)
+    ra = get_session(a["db_url"]).execute(select(*cols).order_by(Clip.id)).all()
+    rb = get_session(b["db_url"]).execute(select(*cols).order_by(Clip.id)).all()
+    assert ra == rb
+
+
 def test_reproducible(tmp_path):
     a = run(out_dir=str(tmp_path / "a"), n_rooms=2, clips_per_room=2, seed=3)
     b = run(out_dir=str(tmp_path / "b"), n_rooms=2, clips_per_room=2, seed=3)

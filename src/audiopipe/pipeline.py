@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import time
+import multiprocessing as mp
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,7 @@ def run(
     snr_range: tuple[float, float] = (0.0, 30.0),
     rt60_range: tuple[float, float] = (0.2, 0.8),
     seed: int = 0,
+    workers: int = 1,
 ) -> dict:
     t0 = time.time()
     out = Path(out_dir)
@@ -65,6 +67,10 @@ def run(
     session.flush()
 
     n_len = int(sr * duration)
+
+    # Loop 1 (main process): make every random choice up front, in a fixed order,
+    # so the dataset depends only on the seed, never on how many workers run.
+    plans = []
     for ri in range(n_rooms):
         spec = simulate.random_room(rng, rt60_range)
         room_row = Room(run_id=run_row.id, dim_x=spec.dims[0], dim_y=spec.dims[1],
@@ -77,32 +83,48 @@ def run(
             si = int(rng.integers(len(srcs)))
             # New source position per clip so DOA/distance labels vary within a room
             spec = simulate.move_source(spec, rng)
+            plans.append(dict(
+                si=si, spec=spec, room_row=room_row, split=split,
+                snr_t=float(rng.uniform(*snr_range)),
+                color=str(rng.choice(["white", "pink", "brown"])),
+                gain=float(rng.uniform(-12, 6)),
+                noise_seed=int(rng.integers(2**32)),  # each clip gets its own noise generator
+            ))
 
-            wet, rt60_meas = simulate.simulate(srcs[si].audio, sr, spec)
-            snr_t = float(rng.uniform(*snr_range))
-            color = str(rng.choice(["white", "pink", "brown"]))
-            gain = float(rng.uniform(-12, 6))
-            x, snr_a = augment.add_noise(wet, snr_t, color, rng)
-            x = augment.apply_gain(x, gain)
-            x, scale = augment.peak_limit(x)
+    # The slow part: room simulation, spread across worker processes.
+    jobs = [(srcs[p["si"]].audio, sr, p["spec"]) for p in plans]
+    if workers > 1:
+        # "spawn" starts fresh worker processes, the same way Windows always does
+        with mp.get_context("spawn").Pool(workers) as pool:
+            results = pool.starmap(simulate.simulate, jobs)
+    else:
+        results = [simulate.simulate(*job) for job in jobs]
 
-            issues = features.quality_checks(x, sr, n_len, x.shape[0])
-            clip = Clip(
-                run_id=run_row.id, source_id=src_rows[si].id, room_id=room_row.id, split=split,
-                audio_path="", features_path="", n_channels=x.shape[0], array_type=spec.array_type,
-                azimuth_deg=round(spec.azimuth_deg, 2), distance_m=round(spec.distance, 3),
-                rt60_measured=round(rt60_meas, 3), snr_target_db=round(snr_t, 2),
-                snr_achieved_db=round(snr_a, 2), noise_color=color, gain_db=round(gain, 2),
-                limiter_scale=round(scale, 4), stats=features.summary_stats(x, sr),
-                passed_qc=not issues, qc_issues=issues,
-            )
-            session.add(clip)
-            session.flush()
-            stem = f"run{run_row.id:03d}_clip{clip.id:05d}"
-            clip.audio_path = str(out / "audio" / f"{stem}.wav")
-            clip.features_path = str(out / "features" / f"{stem}_logmel.npy")
-            sf.write(clip.audio_path, x.T, sr, subtype="FLOAT")
-            np.save(clip.features_path, features.log_mel(x, sr))
+    # Loop 2 (main process): augment, check, save, and catalog each simulated clip.
+    for p, (wet, rt60_meas) in zip(plans, results):
+        si, spec, room_row, split = p["si"], p["spec"], p["room_row"], p["split"]
+        snr_t, color, gain = p["snr_t"], p["color"], p["gain"]
+        x, snr_a = augment.add_noise(wet, snr_t, color, np.random.default_rng(p["noise_seed"]))
+        x = augment.apply_gain(x, gain)
+        x, scale = augment.peak_limit(x)
+
+        issues = features.quality_checks(x, sr, n_len, x.shape[0])
+        clip = Clip(
+            run_id=run_row.id, source_id=src_rows[si].id, room_id=room_row.id, split=split,
+            audio_path="", features_path="", n_channels=x.shape[0], array_type=spec.array_type,
+            azimuth_deg=round(spec.azimuth_deg, 2), distance_m=round(spec.distance, 3),
+            rt60_measured=round(rt60_meas, 3), snr_target_db=round(snr_t, 2),
+            snr_achieved_db=round(snr_a, 2), noise_color=color, gain_db=round(gain, 2),
+            limiter_scale=round(scale, 4), stats=features.summary_stats(x, sr),
+            passed_qc=not issues, qc_issues=issues,
+        )
+        session.add(clip)
+        session.flush()
+        stem = f"run{run_row.id:03d}_clip{clip.id:05d}"
+        clip.audio_path = str(out / "audio" / f"{stem}.wav")
+        clip.features_path = str(out / "features" / f"{stem}_logmel.npy")
+        sf.write(clip.audio_path, x.T, sr, subtype="FLOAT")
+        np.save(clip.features_path, features.log_mel(x, sr))
 
     session.commit()
     summary = report(session, run_row.id)
@@ -143,8 +165,9 @@ def main():
     p.add_argument("--n-rooms", type=int, default=10)
     p.add_argument("--clips-per-room", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--workers", type=int, default=1, help="Processes for room simulation")
     a = p.parse_args()
-    s = run(a.out, a.db_url, a.input_dir, a.n_rooms, a.clips_per_room, seed=a.seed)
+    s = run(a.out, a.db_url, a.input_dir, a.n_rooms, a.clips_per_room, seed=a.seed, workers=a.workers)
     for k, v in s.items():
         print(f"{k:>18}: {v}")
 
