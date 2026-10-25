@@ -54,3 +54,13 @@ Rooms are configured with Sabine's formula to hit a target RT60, but the RT60 me
 - Real room impulse responses (e.g. from public RIR datasets) alongside simulated ones
 - A small baseline model: predict azimuth from the log-mel features of the 4 channels
 - Parallel simulation with `multiprocessing` for large runs
+
+## Results on ESC-50
+
+Ran on the ESC-50 environmental sound dataset (2,000 clips, 50 classes):
+50 rooms × 4 clips = 200 multichannel clips in 30.5 s on a Windows laptop.
+
+- 200/200 clips passed QC
+- SNR error: 0.0 dB (noise scaled exactly to target)
+- Mean RT60 gap: 0.165 s, consistent with the 0.155 s gap on synthetic sources
+- Room-level splits: 140 train / 24 val / 36 test
